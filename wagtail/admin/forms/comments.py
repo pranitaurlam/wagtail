@@ -6,6 +6,7 @@ from modelcluster.forms import BaseChildFormSet
 from modelcluster.models import get_serializable_data_for_fields
 
 from wagtail.admin.templatetags.wagtailadmin_tags import avatar_url, user_display_name
+from wagtail.models import COMMENTS_RELATION_NAME
 
 from .models import WagtailAdminModelForm
 
@@ -106,12 +107,39 @@ class CommentForm(WagtailAdminModelForm):
 class CommentFormSet(BaseChildFormSet):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        valid_comment_ids = [
-            comment.id
-            for comment in self.queryset
-            if comment.has_valid_contentpath(self.instance)
+        # We used to filter the queryset here, but that hides orphans from the cleanup logic in save().
+        # We now do the filtering/cleanup in save() and serialize().
+
+    def save(self, commit=True):
+        # At this point, self.instance has been updated with the new form data
+        instances = super().save(commit=commit)
+
+        # Identify orphaned comments (blocks that have been removed)
+        # We check the entire set of comments associated with the page
+        comments_rel = getattr(self.instance, COMMENTS_RELATION_NAME)
+        orphans = [
+            comment for comment in comments_rel.all()
+            if not comment.has_valid_contentpath(self.instance)
         ]
-        self.queryset = self.queryset.filter(id__in=valid_comment_ids)
+
+        for comment in orphans:
+            comments_rel.remove(comment)
+            comment.delete()
+
+        # Delete comments where the position has been cleared in a Rich Text field
+        for form in self.forms:
+            if (
+                form.instance.pk
+                and form.cleaned_data.get("position") == "[]"
+                and not form.cleaned_data.get("DELETE")
+            ):
+                # removing from the parent's collection so it doesn't get re-saved or included in revisions
+                comments_rel = getattr(self.instance, COMMENTS_RELATION_NAME)
+                comments_rel.remove(form.instance)
+                form.instance.delete()
+                if form.instance in instances:
+                    instances.remove(form.instance)
+        return instances
 
     def serialize(self, bound: bool, user):
         def user_data(user):
@@ -120,6 +148,19 @@ class CommentFormSet(BaseChildFormSet):
         user_pks = {user.pk}
         serialized_comments = []
         for form in self.forms:
+            # Skip orphaned comments in serialization to hide them from the UI
+            is_orphan = not form.instance.has_valid_contentpath(self.instance)
+            if bound:
+                try:
+                    is_orphan = is_orphan or form.cleaned_data.get("position") == "[]"
+                except (AttributeError, KeyError):
+                    # cleaned_data might not be available if form is invalid or not yet cleaned
+                    pass
+            elif form.instance.position == "[]":
+                is_orphan = True
+
+            if is_orphan:
+                continue
             # iterate over comments to retrieve users (to get display names) and serialized versions
             data, comment_user_pks = form.serialize(bound)
             serialized_comments.append(data)
